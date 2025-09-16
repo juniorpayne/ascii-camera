@@ -20,14 +20,19 @@ pip install -r requirements.txt
 ## Terminal ASCII Stream
 
 ```powershell
-python main.py [--device N] [--width 120] [--fps 15]
+python main.py [--device N] [--width 120] [--fps 15] [--mode matrix] [--theme green]
 ```
 
 - `--device` selects the zero-based camera index. Use `0` for the default webcam.
 - `--width` controls the number of character columns rendered. The script will automatically constrain the frame to the terminal width.
 - `--fps` clamps the refresh rate if your camera outputs faster than you want.
+- `--mode` toggles between `classic` grayscale, `matrix` falling glyph rain, and `matrix-void` sparse rain with black gaps.
+- `--theme` picks a monochrome palette (`none`, `green`, `amber`, `orange`) or combine with `--mode matrix` for the neon effect.
 
 Press `q` to quit while the script is running. On Windows consoles that do not support ANSI escape codes, the image may flicker because the screen has to be cleared between frames.
+
+While streaming press `m` to cycle modes, `c` to cycle color themes, `g`/`a`/`o`/`n` to jump to green/amber/orange/none, `r` to reset the palette, and `q` to quit. On terminals without raw key support, fall back to `Ctrl+C` to exit.
+Matrix tuning: use `[`/`]` to adjust the highlight threshold, `,`/`.` for trail decay, and `;`/`'` to raise or lower the rain activation floor.
 
 ## Virtual Camera ASCII Filter
 
@@ -37,7 +42,7 @@ python virtual_cam.py [--device N] [--columns 120] [--fps 20]
 
 - The script opens your webcam, converts each frame to ASCII, renders it to an image, and publishes it via `pyvirtualcam`.
 - Use `--columns` to control the ASCII resolution and `--font-path` if you want to point at a specific monospace `.ttf` font (Consolas is used by default on Windows).
-- `--output-width` / `--output-height` let you force a specific resolution (for example 1280×720) if your meeting software expects it.
+- `--output-width` / `--output-height` let you force a specific resolution (for example 1280ï¿½720) if your meeting software expects it.
 - `--mirror` toggles a mirrored view for natural self-viewing.
 
 Once the script prints the virtual camera name, open your conferencing tool (Teams, Zoom, Meet, etc.) and choose that device as the video source. Stop the script with `Ctrl+C` when you are done.
@@ -47,3 +52,4 @@ Once the script prints the virtual camera name, open your conferencing tool (Tea
 - For the best contrast, run the script in a dark themed terminal and maximize the window.
 - If the capture feed cannot open, verify that no other application is using the camera and that privacy settings allow console applications to access it.
 - The virtual camera stream depends on OS-level support: ensure the relevant driver/backend is installed before running `virtual_cam.py`.
+
