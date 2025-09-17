@@ -40,6 +40,183 @@ COLOR_THEMES = {
 }
 
 
+
+class FramePreprocessor:
+    """Resize and convert frames to grayscale for ASCII rendering."""
+
+    def preprocess(self, frame: np.ndarray, width: int) -> np.ndarray:
+        raise NotImplementedError
+
+
+class CPUFramePreprocessor(FramePreprocessor):
+    def preprocess(self, frame: np.ndarray, width: int) -> np.ndarray:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        height, original_width = gray.shape
+        target_height, interpolation = compute_resize_params(height, original_width, width)
+        if width == original_width and target_height == height:
+            return gray
+        return cv2.resize(gray, (width, target_height), interpolation=interpolation)
+
+
+class CUDAFramePreprocessor(FramePreprocessor):
+    def __init__(self, device_index: Optional[int] = None) -> None:
+        if not hasattr(cv2, "cuda"):
+            raise RuntimeError("OpenCV was built without CUDA support.")
+        device_count = cv2.cuda.getCudaEnabledDeviceCount()
+        if device_count <= 0:
+            raise RuntimeError("No CUDA-enabled devices detected.")
+        if device_index is not None:
+            if device_index < 0 or device_index >= device_count:
+                raise RuntimeError(
+                    f"Requested CUDA device {device_index} is out of range (0-{device_count - 1})."
+                )
+            cv2.cuda.setDevice(device_index)
+        self.stream = cv2.cuda.Stream()
+        self.gpu_src = cv2.cuda_GpuMat()
+        self.gpu_gray = cv2.cuda_GpuMat()
+        self.gpu_resized = cv2.cuda_GpuMat()
+
+    def preprocess(self, frame: np.ndarray, width: int) -> np.ndarray:
+        original_height, original_width = frame.shape[:2]
+        target_height, interpolation = compute_resize_params(original_height, original_width, width)
+        self.gpu_src.upload(frame, stream=self.stream)
+        cv2.cuda.cvtColor(self.gpu_src, cv2.COLOR_BGR2GRAY, dst=self.gpu_gray, stream=self.stream)
+        if width == original_width and target_height == original_height:
+            result_gpu = self.gpu_gray
+        else:
+            cv2.cuda.resize(
+                self.gpu_gray,
+                (width, target_height),
+                dst=self.gpu_resized,
+                interpolation=interpolation,
+                stream=self.stream,
+            )
+            result_gpu = self.gpu_resized
+        result = result_gpu.download(stream=self.stream)
+        self.stream.waitForCompletion()
+        return result
+
+
+
+
+
+
+class TorchFramePreprocessor(FramePreprocessor):
+    def __init__(self, device_spec: Optional[str] = None) -> None:
+        try:
+            import torch
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("PyTorch is not installed.") from exc
+
+        self.torch = torch
+        self.directml_device = None
+
+        if device_spec:
+            spec = device_spec.strip().lower()
+            if spec.startswith("cuda"):
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "Requested CUDA device but PyTorch was not compiled with CUDA support. "
+                        "Install a CUDA-enabled PyTorch build from https://pytorch.org/."
+                    )
+                self.device = torch.device(device_spec)
+            elif spec.startswith("mps"):
+                if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
+                    raise RuntimeError("Requested MPS device but the backend is unavailable on this system.")
+                self.device = torch.device("mps")
+            elif spec.startswith("dml"):
+                self.directml_device = self._init_directml(device_spec)
+                if self.directml_device is None:
+                    raise RuntimeError(
+                        "Requested DirectML device but torch-directml is not installed. "
+                        "Install it with `pip install torch-directml`."
+                    )
+                self.device = self.directml_device
+            else:
+                self.device = torch.device(device_spec)
+        else:
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+            else:
+                self.directml_device = self._init_directml(None)
+                if self.directml_device is None:
+                    raise RuntimeError(
+                        "No GPU-capable torch backend available. Install a CUDA-enabled PyTorch build or torch-directml."
+                    )
+                self.device = self.directml_device
+
+        self.gray_weights = torch.tensor([0.114, 0.587, 0.299], device=self.device, dtype=torch.float32)
+
+    def _init_directml(self, spec: Optional[str]):
+        try:
+            import torch_directml  # type: ignore
+        except ImportError:
+            return None
+        if spec and ":" in spec:
+            _, index = spec.split(":", 1)
+            return torch_directml.device(int(index))
+        return torch_directml.device()
+
+    def preprocess(self, frame: np.ndarray, width: int) -> np.ndarray:
+        torch = self.torch
+        original_height, original_width = frame.shape[:2]
+        target_height, _ = compute_resize_params(original_height, original_width, width)
+        with torch.no_grad():
+            frame_tensor = torch.as_tensor(frame, device=self.device, dtype=torch.float32)
+            frame_tensor = frame_tensor.permute(2, 0, 1).unsqueeze(0) / 255.0
+            gray = torch.tensordot(frame_tensor, self.gray_weights, dims=([1], [0]))
+            gray = gray.unsqueeze(1)
+            mode = "area" if (target_height < original_height or width < original_width) else "bilinear"
+            interp_kwargs = {"align_corners": False} if mode != "area" else {}
+            resized = torch.nn.functional.interpolate(
+                gray,
+                size=(target_height, width),
+                mode=mode,
+                **interp_kwargs,
+            )
+            result = (resized.squeeze().clamp(0.0, 1.0) * 255.0).to(torch.uint8).cpu().numpy()
+        return result
+
+def compute_resize_params(original_height: int, original_width: int, target_width: int) -> tuple[int, int]:
+    if original_width <= 0:
+        original_width = 1
+    target_height = max(1, int((original_height / original_width) * target_width * CHAR_ASPECT))
+    interpolation = cv2.INTER_AREA if target_width < original_width else cv2.INTER_LINEAR
+    return target_height, interpolation
+
+
+
+
+def create_preprocessor(
+    mode: str,
+    cuda_device: Optional[int],
+    torch_device: Optional[str],
+) -> FramePreprocessor:
+    if mode == "cpu":
+        return CPUFramePreprocessor()
+    if mode == "cuda":
+        return CUDAFramePreprocessor(cuda_device)
+    if mode == "torch":
+        return TorchFramePreprocessor(torch_device)
+    if mode == "auto":
+        try:
+            preprocessor = CUDAFramePreprocessor(cuda_device)
+            print("Using CUDA accelerator for preprocessing.", file=sys.stderr)
+            return preprocessor
+        except RuntimeError as exc:
+            print(f"CUDA acceleration unavailable ({exc}). Trying torch backend...", file=sys.stderr)
+        try:
+            preprocessor = TorchFramePreprocessor(torch_device)
+            print("Using torch accelerator for preprocessing.", file=sys.stderr)
+            return preprocessor
+        except RuntimeError as exc2:
+            print(f"Torch acceleration unavailable ({exc2}). Falling back to CPU.", file=sys.stderr)
+        return CPUFramePreprocessor()
+    raise ValueError(f"Unknown accelerator mode: {mode}")
+
+
 class ControlPoller:
     """Non-blocking key polling that works on Windows and most POSIX shells."""
 
@@ -127,6 +304,10 @@ class ControlPoller:
             events.append("matrix_floor_down")
         elif ch in ("'", '"'):
             events.append("matrix_floor_up")
+        elif ch in ("+", "="):
+            events.append("matrix_contrast_up")
+        elif ch in ("-", "_"):
+            events.append("matrix_contrast_down")
         return events
 
 
@@ -143,6 +324,7 @@ class MatrixModeState:
         self.decay = 0.86
         self.activation_floor = 0.05
         self.smoothed = np.zeros((0, 0), dtype=np.float32)
+        self.contrast_gain = 1.0
 
     def reset(self) -> None:
         self.rain = np.zeros((0, 0), dtype=np.float32)
@@ -156,12 +338,16 @@ class MatrixModeState:
         return self.head_threshold
 
     def adjust_decay(self, delta: float) -> float:
-        self.decay = float(np.clip(self.decay + delta, 0.6, 0.98))
+        self.decay = float(np.clip(self.decay + delta, 0.2, 0.98))
         return self.decay
 
     def adjust_activation_floor(self, delta: float) -> float:
-        self.activation_floor = float(np.clip(self.activation_floor + delta, 0.0, 0.3))
+        self.activation_floor = float(np.clip(self.activation_floor + delta, 0.0, 0.5))
         return self.activation_floor
+
+    def adjust_contrast_gain(self, delta: float) -> float:
+        self.contrast_gain = float(np.clip(self.contrast_gain + delta, 0.2, 5.0))
+        return self.contrast_gain
 
     def apply(
         self, base_chars: np.ndarray, intensity: np.ndarray
@@ -172,7 +358,7 @@ class MatrixModeState:
             self.smoothed = normalized.copy()
         else:
             self.smoothed = np.clip(self.smoothed * 0.82 + normalized * 0.18, 0.0, 1.0)
-        contrast_source = self.smoothed
+        contrast_source = np.clip(self.smoothed * self.contrast_gain, 0.0, 1.0)
         contrast = np.power(contrast_source, 0.7, dtype=np.float32)
         indices = np.clip(
             np.rint(contrast * (len(MATRIX_CHAR_POOL) - 1)).astype(np.int32),
@@ -333,33 +519,65 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Color theme for ASCII output (auto selects based on the mode).",
     )
+    parser.add_argument(
+        "--accelerator",
+        choices=["auto", "cpu", "cuda", "torch"],
+        default="auto",
+        help="Preprocessing backend (default: auto).",
+    )
+    parser.add_argument(
+        "--cuda-device",
+        type=int,
+        default=None,
+        help="CUDA device index when using the CUDA accelerator.",
+    )
+    parser.add_argument(
+        "--torch-device",
+        default=None,
+        help="Device string for the torch accelerator (e.g. cuda:0, mps, dml:0).",
+    )
     return parser.parse_args()
 
 
-def resolve_width(target_width: Optional[int]) -> int:
-    term_width = shutil.get_terminal_size((80, 24)).columns
+def resolve_width(
+    frame_shape: tuple[int, ...], target_width: Optional[int]
+) -> int:
+    term_size = shutil.get_terminal_size((80, 24))
+    term_width = term_size.columns
+
     if target_width is None:
-        return max(2, term_width)
+        width = term_width if term_width > 0 else 80
+    else:
+        width = target_width
+
     if term_width > 0:
-        return max(2, min(target_width, term_width))
-    return max(2, target_width)
+        width = min(width, term_width)
+    width = max(2, int(width))
+
+    if len(frame_shape) >= 2:
+        original_height = int(frame_shape[0])
+        original_width = int(frame_shape[1])
+    else:
+        original_height = 1
+        original_width = 1
+
+    if term_size.lines > 0 and original_width > 0:
+        max_rows = max(2, term_size.lines - 1)
+        aspect = (original_height / original_width) * CHAR_ASPECT
+        if aspect > 0:
+            max_width_from_rows = int(max_rows / aspect)
+            if max_width_from_rows >= 2:
+                width = min(width, max_width_from_rows)
+            else:
+                width = 2
+    return max(2, width)
 
 
 def frame_to_ascii(
-    gray_frame: np.ndarray, width: int, charset: np.ndarray, invert: bool
+    gray_frame: np.ndarray, charset: np.ndarray, invert: bool
 ) -> tuple[np.ndarray, np.ndarray]:
-    height, original_width = gray_frame.shape
-    aspect_height = max(1, int((height / original_width) * width * CHAR_ASPECT))
-    resized = cv2.resize(
-        gray_frame,
-        (width, aspect_height),
-        interpolation=cv2.INTER_AREA if width < original_width else cv2.INTER_LINEAR,
-    )
-
-    if invert:
-        resized = 255 - resized
-
-    normalized = resized.astype(np.float32) / 255.0
+    working = 255 - gray_frame if invert else gray_frame
+    normalized = working.astype(np.float32) / 255.0
     indices = np.clip(
         np.rint(normalized * (len(charset) - 1)).astype(np.int32),
         0,
@@ -442,7 +660,6 @@ def main() -> int:
         return 1
 
     args = parse_args()
-    width = resolve_width(args.width)
 
     charset_raw = args.charset or ASCII_CHARS
     if len(charset_raw) < 2:
@@ -453,6 +670,12 @@ def main() -> int:
     capture = cv2.VideoCapture(args.device)
     if not capture.isOpened():
         print(f"Could not open camera device {args.device}.", file=sys.stderr)
+        return 1
+
+    try:
+        preprocessor = create_preprocessor(args.accelerator, args.cuda_device, args.torch_device)
+    except RuntimeError as exc:
+        print(f"Failed to initialize {args.accelerator} accelerator: {exc}", file=sys.stderr)
         return 1
 
     frame_interval = 0.0 if args.fps <= 0 else 1.0 / args.fps
@@ -473,7 +696,7 @@ def main() -> int:
             file=sys.stderr,
         )
         print(
-            "Matrix tuning: [ ] head threshold | , . decay | ; ' activation floor",
+            "Matrix tuning: [ ] head threshold | , . decay | ; ' activation floor | + - contrast",
             file=sys.stderr,
         )
 
@@ -493,9 +716,9 @@ def main() -> int:
                 print("Failed to read from camera. Exiting.", file=sys.stderr)
                 return 1
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            width = resolve_width(args.width)
-            ascii_chars, intensity = frame_to_ascii(gray, width, charset, args.invert)
+            width = resolve_width(frame.shape, args.width)
+            gray = preprocessor.preprocess(frame, width)
+            ascii_chars, intensity = frame_to_ascii(gray, charset, args.invert)
 
             overrides = None
             display_chars = ascii_chars
@@ -571,13 +794,23 @@ def main() -> int:
                 elif event == "matrix_floor_up":
                     state = matrix_states.get(current_mode)
                     if state is not None:
-                        value = state.adjust_activation_floor(0.01)
-                        print(f"Matrix activation floor: {value:.2f}", file=sys.stderr)
+                        value = state.adjust_activation_floor(0.002)
+                        print(f"Matrix activation floor: {value:.3f}", file=sys.stderr)
                 elif event == "matrix_floor_down":
                     state = matrix_states.get(current_mode)
                     if state is not None:
-                        value = state.adjust_activation_floor(-0.01)
-                        print(f"Matrix activation floor: {value:.2f}", file=sys.stderr)
+                        value = state.adjust_activation_floor(-0.002)
+                        print(f"Matrix activation floor: {value:.3f}", file=sys.stderr)
+                elif event == "matrix_contrast_up":
+                    state = matrix_states.get(current_mode)
+                    if state is not None:
+                        value = state.adjust_contrast_gain(0.1)
+                        print(f"Matrix contrast gain: {value:.2f}", file=sys.stderr)
+                elif event == "matrix_contrast_down":
+                    state = matrix_states.get(current_mode)
+                    if state is not None:
+                        value = state.adjust_contrast_gain(-0.1)
+                        print(f"Matrix contrast gain: {value:.2f}", file=sys.stderr)
     except KeyboardInterrupt:
         return 0
     finally:
