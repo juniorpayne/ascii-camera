@@ -82,7 +82,7 @@ def parse_args() -> argparse.Namespace:
         "--accelerator",
         choices=["auto", "cpu", "cuda", "torch"],
         default="auto",
-        help="Preprocessing backend (default: auto).",
+        help="Preprocessing backend (auto prefers OpenCV CUDA, then torch GPU/DirectML, otherwise CPU).",
     )
     parser.add_argument(
         "--cuda-device",
@@ -201,48 +201,6 @@ def grayscale_to_rgb(intensity: np.ndarray) -> np.ndarray:
     return np.stack([values, values, values], axis=-1)
 
 
-def render_char_grid_to_image(
-    chars: np.ndarray,
-    intensity: np.ndarray,
-    rgb_colors: Optional[np.ndarray],
-    theme: str,
-    font: ImageFont.ImageFont,
-    background: tuple[int, int, int] = (0, 0, 0),
-    line_spacing: Optional[int] = None,
-) -> Image.Image:
-    rows, cols = chars.shape
-    if rows == 0 or cols == 0:
-        return Image.new("RGB", (16, 16), background)
-
-    char_width, char_height = _text_size(font, "M")
-    char_width = max(1, char_width)
-    char_height = max(1, char_height)
-    spacing = line_spacing if line_spacing is not None else max(2, char_height // 6)
-    margin_x = max(4, char_width // 2)
-    margin_y = max(4, spacing)
-
-    img_width = margin_x * 2 + char_width * cols
-    img_height = margin_y * 2 + rows * (char_height + spacing)
-
-    image = Image.new("RGB", (img_width, img_height), background)
-    draw = ImageDraw.Draw(image)
-    grayscale_cache = None if rgb_colors is not None else grayscale_to_rgb(intensity)
-
-    for row in range(rows):
-        y = margin_y + row * (char_height + spacing)
-        for col in range(cols):
-            ch = chars[row, col]
-            if ch == " ":
-                continue
-            if rgb_colors is not None:
-                color = tuple(int(c) for c in rgb_colors[row, col])
-            else:
-                gray = grayscale_cache[row, col]
-                color = tuple(int(c) for c in gray)
-            draw.text((margin_x + col * char_width, y), ch, font=font, fill=color)
-    return image
-
-
 def main() -> int:
     args = parse_args()
 
@@ -300,14 +258,14 @@ def main() -> int:
             return 1
 
         gray = preprocessor.preprocess(frame, columns)
-        ascii_chars, intensity = ascii_main.frame_to_ascii(gray, charset, args.invert)
+        ascii_frame = ascii_main.frame_to_ascii(gray, charset, args.invert)
 
-        display_chars = ascii_chars
-        display_intensity = intensity
+        display_chars = ascii_frame.chars
+        display_intensity = ascii_frame.intensity
         overrides: Optional[np.ndarray] = None
         state = matrix_states.get(current_mode)
         if state is not None:
-            display_chars, display_intensity, overrides = state.apply(ascii_chars, intensity)
+            display_chars, display_intensity, overrides = state.apply(ascii_frame)
 
         active_theme = current_theme
         if not theme_locked and args.theme == "auto":
@@ -316,7 +274,14 @@ def main() -> int:
         color_codes = compute_color_codes(display_intensity, active_theme, overrides)
         rgb_colors = color_codes_to_rgb(color_codes) if color_codes is not None else None
 
-        ascii_image = render_char_grid_to_image(display_chars, display_intensity, rgb_colors, active_theme, font)
+        ascii_image = ascii_main.render_char_grid_to_image(
+            display_chars,
+            display_intensity,
+            rgb_colors,
+            active_theme,
+            font,
+            ascii_frame=ascii_frame,
+        )
         frame_rgb = np.array(ascii_image)
         cam_width = args.output_width or frame_rgb.shape[1]
         cam_height = args.output_height or frame_rgb.shape[0]
@@ -360,17 +325,17 @@ def main() -> int:
                     return 1
 
                 gray = preprocessor.preprocess(frame, columns)
-                ascii_chars, intensity = ascii_main.frame_to_ascii(
+                ascii_frame = ascii_main.frame_to_ascii(
                     gray, charset, args.invert
                 )
 
-                display_chars = ascii_chars
-                display_intensity = intensity
+                display_chars = ascii_frame.chars
+                display_intensity = ascii_frame.intensity
                 overrides = None
                 state = matrix_states.get(current_mode)
                 if state is not None:
                     display_chars, display_intensity, overrides = state.apply(
-                        ascii_chars, intensity
+                        ascii_frame
                     )
 
                 active_theme = current_theme
@@ -382,8 +347,13 @@ def main() -> int:
                     color_codes_to_rgb(color_codes) if color_codes is not None else None
                 )
 
-                ascii_image = render_char_grid_to_image(
-                    display_chars, display_intensity, rgb_colors, active_theme, font
+                ascii_image = ascii_main.render_char_grid_to_image(
+                    display_chars,
+                    display_intensity,
+                    rgb_colors,
+                    active_theme,
+                    font,
+                    ascii_frame=ascii_frame,
                 )
                 frame_rgb = np.array(ascii_image)
                 frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
